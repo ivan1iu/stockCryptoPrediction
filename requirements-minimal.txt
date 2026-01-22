@@ -1,0 +1,6 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+yfinance
+# If you want plotting in non-GUI environments, you may need 'python3-tk' or similar packages for macOS

@@ -11,33 +11,20 @@ Assumptions made:
 If you want a different ticker or period, change the TICKER and `days_back` variables below.
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import LinearRegression
 
-# Try to import TensorFlow; if it's not available, print a helpful message and exit
 try:
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense
-except Exception as e:
-    venv_python = '/Users/ivanliu/Desktop/isehw/.venv/bin/python'
-    msg = f"""
-Required dependency missing: TensorFlow (import error: {e}).
-
-Run this script with the project's virtualenv which already has the required packages:
-
-  source /Users/ivanliu/Desktop/isehw/.venv/bin/activate
-  python predstock_hourly.py
-
-or without activation:
-  {venv_python} /Users/ivanliu/Desktop/isehw/predstock_hourly.py
-
-Exiting.
-"""
-    print(msg)
-    raise SystemExit(1)
+    HAS_TF = True
+except Exception:
+    HAS_TF = False
 
 import yfinance as yf
 from datetime import datetime, timedelta
@@ -45,15 +32,31 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ---------------- USER CONFIG ----------------
-TICKER = 'NNE'    # default to BTC hourly; change to any ticker (e.g., 'AAPL', 'ETH-USD')
-days_back = 90        # how many days of hourly data to download (assumption)
-lookback = 24         # use last 24 hours to predict next hour
-predict_hours = 24    # predict next 24 hours
+# CLI / defaults
+DEFAULT_TICKER = 'BTC-USD'
+
+parser = argparse.ArgumentParser(description='Hourly Stock/Crypto Price Prediction (LSTM or sklearn fallback)')
+parser.add_argument('--ticker', '-t', default=DEFAULT_TICKER, help='Ticker symbol (default: BTC-USD)')
+parser.add_argument('--days-back', '-d', type=int, default=90, help='Days of history to download (default: 90)')
+parser.add_argument('--lookback', '-l', type=int, default=24, help='Lookback window in hours (default: 24)')
+parser.add_argument('--predict-hours', '-p', type=int, default=24, help='Hours to predict into the future (default: 24)')
+parser.add_argument('--epochs', '-e', type=int, default=10, help='Training epochs for LSTM (default: 10)')
+parser.add_argument('--no-train', action='store_true', help='Skip training and only download/plot data')
+args = parser.parse_args()
+
+TICKER = args.ticker
+days_back = args.days_back
+lookback = args.lookback
+predict_hours = args.predict_hours
+EPOCHS = args.epochs
+NO_TRAIN = args.no_train
 # ---------------------------------------------
 
 print("=" * 80)
 print(f"{TICKER} Hourly Price Prediction - Current Market Data")
 print("=" * 80)
+if not HAS_TF:
+    print("Note: TensorFlow not available. Falling back to scikit-learn LinearRegression for modeling.")
 
 # STEP 1: Download hourly data
 end_date = datetime.now()
@@ -65,7 +68,17 @@ try:
     if len(data_df) == 0:
         print(f"✗ Error: No hourly data found for ticker '{TICKER}' in the requested period")
         print("Try a different ticker or reduce `days_back` for hourly data.")
-        raise SystemExit(1)
+        # Try a sensible fallback for users who did not specify a ticker
+        if TICKER == DEFAULT_TICKER:
+            print("No data for default ticker; exiting.")
+            raise SystemExit(1)
+        else:
+            print(f"Attempting fallback to {DEFAULT_TICKER}...")
+            TICKER = DEFAULT_TICKER
+            data_df = yf.download(TICKER, start=start_date, end=end_date, interval='1h', progress=False)
+            if len(data_df) == 0:
+                print("Fallback also failed; exiting.")
+                raise SystemExit(1)
     # Try to get a nicer name
     try:
         ticker_info = yf.Ticker(TICKER)
@@ -123,22 +136,52 @@ x_train = x_train.reshape(x_train.shape[0], x_train.shape[1], 1)
 x_test = x_test.reshape(x_test.shape[0], x_test.shape[1], 1)
 print(f"✓ x_train shape: {x_train.shape}, x_test shape: {x_test.shape}")
 
-# STEP 5: Build & Train
-print("\n[STEP 5] Building and training LSTM model (LSTM(4) -> Dense(1))")
-model = Sequential()
-model.add(LSTM(4, input_shape=(x_train.shape[1], 1)))
-model.add(Dense(1))
-model.compile(optimizer='adam', loss='mean_squared_error')
-print(model.summary())
+# STEP 5: Build & Train (LSTM if TF available, otherwise sklearn LinearRegression)
+print("\n[STEP 5] Building and training model")
 
-print("\nTraining (this may take a few minutes)...")
-history = model.fit(x_train, y_train, batch_size=32, epochs=100, verbose=1, validation_split=0.1)
-print("✓ Training completed")
+def build_and_train(x_train, y_train, use_tf=True, epochs=10):
+    if use_tf:
+        model = Sequential()
+        model.add(LSTM(4, input_shape=(x_train.shape[1], 1)))
+        model.add(Dense(1))
+        model.compile(optimizer='adam', loss='mean_squared_error')
+        print(model.summary())
+        print("\nTraining LSTM (this may take a few minutes)...")
+        history = model.fit(x_train, y_train, batch_size=32, epochs=epochs, verbose=1, validation_split=0.1)
+        return model, history
+    else:
+        # sklearn LinearRegression expects 2D input
+        x2 = x_train.reshape(x_train.shape[0], x_train.shape[1])
+        print("Training LinearRegression (fast fallback)...")
+        lr = LinearRegression()
+        lr.fit(x2, y_train)
+        history = {'loss': [], 'val_loss': []}
+        return lr, history
+
+if NO_TRAIN:
+    print("Skipping training as requested (--no-train). Exiting after download and plots.")
+    # Continue to plotting without a trained model
+    history = {'loss': [], 'val_loss': []}
+    model = None
+else:
+    model, history = build_and_train(x_train, y_train, use_tf=HAS_TF, epochs=EPOCHS)
 
 # STEP 6: Predictions
 print("\n[STEP 6] Making predictions...")
-train_pred = model.predict(x_train, verbose=0)
-test_pred = model.predict(x_test, verbose=0)
+if model is None:
+    print("No model available (training skipped). Exiting after plots.")
+    raise SystemExit(0)
+
+def predict_with_model(model, x):
+    if HAS_TF:
+        pred = model.predict(x, verbose=0)
+    else:
+        x2 = x.reshape(x.shape[0], x.shape[1])
+        pred = model.predict(x2).reshape(-1, 1)
+    return pred
+
+train_pred = predict_with_model(model, x_train)
+test_pred = predict_with_model(model, x_test)
 
 train_pred = scaler.inverse_transform(train_pred)
 y_train_act = scaler.inverse_transform(y_train.reshape(-1, 1))
@@ -155,12 +198,20 @@ print(f"Testing RMSE: ${test_rmse:.2f}")
 
 # STEP 7: Future hourly predictions
 print(f"\n[STEP 7] Predicting next {predict_hours} hours...")
-last_seq = data_normalized[-lookback:].reshape(1, lookback, 1)
 future_preds = []
-for i in range(predict_hours):
-    nxt = model.predict(last_seq, verbose=0)
-    future_preds.append(nxt[0, 0])
-    last_seq = np.append(last_seq[0, 1:, :], [[nxt[0, 0]]], axis=0).reshape(1, lookback, 1)
+if HAS_TF:
+    last_seq = data_normalized[-lookback:].reshape(1, lookback, 1)
+    for i in range(predict_hours):
+        nxt = model.predict(last_seq, verbose=0)
+        future_preds.append(nxt[0, 0])
+        last_seq = np.append(last_seq[0, 1:, :], [[nxt[0, 0]]], axis=0).reshape(1, lookback, 1)
+else:
+    # sklearn: iterate using flattened last window
+    last_window = data_normalized[-lookback:].reshape(1, lookback)
+    for i in range(predict_hours):
+        nxt = model.predict(last_window)
+        future_preds.append(nxt[0])
+        last_window = np.append(last_window[:, 1:], nxt.reshape(1, 1), axis=1)
 
 future_preds = scaler.inverse_transform(np.array(future_preds).reshape(-1, 1))
 
